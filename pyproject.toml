@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "android-instrumentor"
+version = "0.1.0"
+description = "Turnkey Android APK instrumentation and behavioral analysis framework"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24.0",
+  "flask>=3.0.0",
+  "tqdm>=4.65.0",
+  "pandas>=2.0.0",
+  "scikit-learn>=1.3.0",
+  "tensorflow>=2.15.0",
+  "shap>=0.43.0",
+  "matplotlib>=3.7.0",
+  "psycopg2-binary>=2.9.0",
+]
+
+[project.scripts]
+android-instrumentor = "instrument:main"
+android-orchestrator = "orchestrator:main"
+android-feature-extractor = "feature_extractor:main"
+android-train-model = "train_model:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
