@@ -271,6 +271,7 @@ class Orchestrator:
         frida_enabled = bool(analysis_cfg.get("frida_enabled", True))
         frida_duration = int(analysis_cfg.get("frida_duration", 45))
         monkey_events = int(analysis_cfg.get("monkey_events", 50))
+        evasion_script = analysis_cfg.get("evasion_script", "frida_evasion.js")
 
         apk_path = os.path.abspath(apk_path)
         trace = {
@@ -618,7 +619,20 @@ class Orchestrator:
             print(f"[!] Frida script missing: {script_path}")
             return
 
-        # Ensure frida-server if present on device (optional)
+        evasion_enabled = self.app_config.get("evasion", {}).get("enabled", True)
+        evasion_script = self.app_config.get("analysis", {}).get("evasion_script", "frida_evasion.js")
+        evasion_path = evasion_script if os.path.isabs(evasion_script) else str(ROOT / evasion_script)
+
+        combined_script = script_path
+        if evasion_enabled and os.path.isfile(evasion_path):
+            combined_dir = os.path.join(self.output_dir, "combined_hooks.js")
+            with open(script_path, "r") as f1, open(evasion_path, "r") as f2:
+                combined = f1.read() + "\n\n// === Evasion Hooks ===\n" + f2.read()
+            with open(combined_dir, "w") as f:
+                f.write(combined)
+            combined_script = combined_dir
+            print(f"[*] Combined hooks + evasion scripts ({len(combined)} bytes)")
+
         self._ensure_frida_server()
 
         cmd = [frida_bin]
@@ -630,8 +644,7 @@ class Orchestrator:
             cmd.extend(["-f", package])
         else:
             cmd.extend(["-n", package])
-        cmd.extend(["-l", script_path, "--runtime=v8"])
-        # frida 17 uses different no-pause flags; try modern form
+        cmd.extend(["-l", combined_script, "--runtime=v8"])
         env = os.environ.copy()
         print(f"[*] Starting Frida: {' '.join(cmd)}")
         log_path = os.path.join(self.output_dir, "frida_console.log")

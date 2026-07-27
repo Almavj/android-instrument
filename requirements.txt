@@ -13,3 +13,10 @@ frida-tools>=12.0.0
 matplotlib>=3.7.0
 psycopg2-binary>=2.9.0
 pytest>=7.0.0
+# Security & crypto (hardened C2 + evasion)
+cryptography>=41.0.0
+pyOpenSSL>=23.0.0
+# Network covert channels
+dnspython>=2.4.0
+# Reporting
+jinja2>=3.1.0

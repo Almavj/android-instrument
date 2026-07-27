@@ -127,6 +127,12 @@ function hookJava() {
             hookCount += 1;
         } catch (e) {}
 
+        // Retrofit (very common in modern apps)
+        try {
+            var Retrofit = Java.use("retrofit2.Retrofit");
+            emit("network", { name: "Retrofit.detected", message: "Retrofit HTTP client present" });
+        } catch (e) {}
+
         // File I/O
         try {
             var File = Java.use("java.io.File");
@@ -185,6 +191,16 @@ function hookJava() {
                 return this.exec(cmd);
             };
             hookCount += 2;
+        } catch (e) {}
+
+        // ProcessBuilder
+        try {
+            var PB = Java.use("java.lang.ProcessBuilder");
+            PB.start.implementation = function () {
+                emit("exec", { name: "ProcessBuilder.start", args: safeStr(this.command()) });
+                return this.start();
+            };
+            hookCount += 1;
         } catch (e) {}
 
         // Telephony / identifiers
@@ -281,7 +297,11 @@ function hookJava() {
                 emit("clipboard", { name: "ClipboardManager.getPrimaryClip" });
                 return this.getPrimaryClip();
             };
-            hookCount += 1;
+            CM.setPrimaryClip.implementation = function (clip) {
+                emit("clipboard", { name: "ClipboardManager.setPrimaryClip" });
+                return this.setPrimaryClip(clip);
+            };
+            hookCount += 2;
         } catch (e) {}
 
         // Package enumeration
@@ -310,12 +330,77 @@ function hookJava() {
             hookCount += 1;
         } catch (e) {}
 
+        // WebView (common for C2 / phishing)
+        try {
+            var WV = Java.use("android.webkit.WebView");
+            WV.loadUrl.overload("java.lang.String").implementation = function (url) {
+                emit("webview", { name: "WebView.loadUrl", url: safeStr(url) });
+                return this.loadUrl(url);
+            };
+            hookCount += 1;
+        } catch (e) {}
+
+        // SharedPreferences (credential storage)
+        try {
+            var SP = Java.use("android.app.SharedPreferencesImpl");
+            SP.putString.overload("java.lang.String", "java.lang.String").implementation = function (key, value) {
+                emit("credentials", { name: "SharedPreferences.putString", key: safeStr(key), value: safeStr(value) });
+                return this.putString(key, value);
+            };
+            hookCount += 1;
+        } catch (e) {}
+
+        // KeyStore (crypto keys)
+        try {
+            var KS = Java.use("java.security.KeyStore");
+            KS.getKey.overload("java.lang.String", "[C").implementation = function (alias, password) {
+                emit("credentials", { name: "KeyStore.getKey", alias: safeStr(alias) });
+                return this.getKey(alias, password);
+            };
+            hookCount += 1;
+        } catch (e) {}
+
+        // Wi-Fi info
+        try {
+            var WifiInfo = Java.use("android.net.wifi.WifiInfo");
+            WifiInfo.getMacAddress.implementation = function () {
+                var ret = this.getMacAddress();
+                emit("network", { name: "WifiInfo.getMacAddress", result: safeStr(ret) });
+                return ret;
+            };
+            hookCount += 1;
+        } catch (e) {}
+
+        // Bluetooth
+        try {
+            var BTAdapter = Java.use("android.bluetooth.BluetoothAdapter");
+            BTAdapter.getAddress.implementation = function () {
+                var ret = this.getAddress();
+                emit("network", { name: "BluetoothAdapter.getAddress", result: safeStr(ret) });
+                return ret;
+            };
+            hookCount += 1;
+        } catch (e) {}
+
+        // Root detection bypass (detect when app checks for root)
+        try {
+            var Runtime = Java.use("java.lang.Runtime");
+            Runtime.exec.overload("java.lang.String").implementation = function (cmd) {
+                emit("exec", { name: "Runtime.exec", args: safeStr(cmd) });
+                if (cmd.indexOf("su") !== -1 || cmd.indexOf("which") !== -1) {
+                    emit("evasion", { name: "root_check_detected", args: safeStr(cmd) });
+                }
+                return this.exec(cmd);
+            };
+            hookCount += 1;
+        } catch (e) {}
+
         emit("hooks_ready", { hook_count: hookCount });
     });
 }
 
 function hookNative() {
-    var names = ["open", "openat", "connect", "execve"];
+    var names = ["open", "openat", "connect", "execve", "dlopen", "dlsym"];
     names.forEach(function (name) {
         try {
             var addr = Module.findExportByName(null, name);
@@ -332,6 +417,21 @@ function hookNative() {
                             payload.event_hint = "exec";
                         } else if (name === "connect") {
                             payload.event_hint = "network";
+                            try {
+                                var sockaddr = args[1];
+                                var family = sockaddr.readU16();
+                                if (family === 2) {
+                                    var port = (sockaddr.add(2).readU8() << 8) | sockaddr.add(3).readU8();
+                                    var ip = sockaddr.add(4).readByteArray(4);
+                                    payload.remote_addr = Array.from(new Uint8Array(ip)).join(".") + ":" + port;
+                                }
+                            } catch (e) {}
+                        } else if (name === "dlopen") {
+                            payload.path = args[0].readCString();
+                            payload.event_hint = "library";
+                        } else if (name === "dlsym") {
+                            payload.symbol = args[1].readCString();
+                            payload.event_hint = "symbol";
                         }
                     } catch (e) {}
                     if (payload.event_hint === "file") {
@@ -340,6 +440,10 @@ function hookNative() {
                         emit("exec", payload);
                     } else if (payload.event_hint === "network") {
                         emit("network", payload);
+                    } else if (payload.event_hint === "library") {
+                        emit("library", payload);
+                    } else if (payload.event_hint === "symbol") {
+                        emit("symbol", payload);
                     } else {
                         emit("api", payload);
                     }

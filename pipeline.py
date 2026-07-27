@@ -67,12 +67,12 @@ def _port_available(host: str, port: int) -> bool:
 
 def start_c2(cfg: dict, result_root: Path) -> subprocess.Popen | None:
     import socket
-    host = str(cfg.get("c2", {}).get("host", "0.0.0.0"))
-    port = int(cfg.get("c2", {}).get("port", 5000))
+    c2_cfg = cfg.get("c2", {})
+    host = str(c2_cfg.get("host", "0.0.0.0"))
+    port = int(c2_cfg.get("port", 8080))
     db = result_root / "c2_data.db"
     log = result_root / "c2_server.log"
 
-    # Find an available port starting from configured one
     for attempt in range(10):
         try_port = port + attempt
         if _port_available("0.0.0.0", try_port):
@@ -86,7 +86,16 @@ def start_c2(cfg: dict, result_root: Path) -> subprocess.Popen | None:
         sys.executable, str(ROOT / "c2_server.py"),
         "--host", host, "--port", str(port), "--db", str(db),
     ]
-    print(f"[*] Starting C2 on {host}:{port}")
+    tls_cert = c2_cfg.get("tls_cert")
+    tls_key = c2_cfg.get("tls_key")
+    if tls_cert and tls_key and os.path.isfile(os.path.expanduser(str(tls_cert))):
+        cmd.extend(["--tls-cert", os.path.expanduser(str(tls_cert))])
+        cmd.extend(["--tls-key", os.path.expanduser(str(tls_key))])
+
+    jitter = c2_cfg.get("jitter_ms", 5000)
+    cmd.extend(["--jitter", str(jitter)])
+
+    print(f"[*] Starting hardened C2 on {host}:{port} (jitter={jitter}ms)")
     fh = open(log, "w", encoding="utf-8")
     proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=str(ROOT))
     proc._log_fh = fh  # type: ignore[attr-defined]
@@ -323,6 +332,22 @@ def main():
                 check=False,
             )
             meta["stages"]["train"] = {"model": str(model_out)}
+
+        # Generate report
+        report_out = result_root / "report.html"
+        latest_trace = traces_dir / "latest_trace.json"
+        db_path = traces_dir / "instrumentation.db"
+        report_args = [
+            sys.executable, str(ROOT / "reporting.py"),
+            "--output", str(report_out),
+        ]
+        if latest_trace.is_file():
+            report_args.extend(["--trace", str(latest_trace)])
+        if db_path.is_file():
+            report_args.extend(["--db", str(db_path)])
+        if latest_trace.is_file() or db_path.is_file():
+            run(report_args, result_root / "report.log", check=False)
+            meta["stages"]["report"] = {"path": str(report_out)}
 
         meta["finished"] = time.time()
         meta["duration"] = meta["finished"] - meta["started"]

